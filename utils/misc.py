@@ -125,6 +125,7 @@ class DistLogger(object):
 
 
 class TensorboardLogger(object):
+    '''对pytorch的tensorboard SummaryWrite封装，记录训练过程中各种可视化数据与指标'''
     def __init__(self, log_dir, filename_suffix):
         try: import tensorflow_io as tfio
         except: pass
@@ -184,11 +185,11 @@ class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
     window or the global series average.
     """
-    
+    '''平滑值计算器，计算滑动窗口内的统计量'''
     def __init__(self, window_size=30, fmt=None):
         if fmt is None:
             fmt = "{median:.4f} ({global_avg:.4f})"
-        self.deque = deque(maxlen=window_size)
+        self.deque = deque(maxlen=window_size) # 滑动窗口
         self.total = 0.0
         self.count = 0
         self.fmt = fmt
@@ -209,6 +210,7 @@ class SmoothedValue(object):
         self.count = int(t[0])
         self.total = t[1]
     
+    # 统计量
     @property
     def median(self):
         return np.median(self.deque) if len(self.deque) else 0
