@@ -1,0 +1,9 @@
+{
+"is_master": true,
+"name": "text",
+"cmd": "--depth=16 --bs=192 --ep=200 --fp16=1 --alng=1e-3 --wpe=0.1 --ac=2",
+"commit": "3f1029565306d1b471643e7c360294c8a0b2a8e4",
+"branch": "main",
+"tb_log_dir_path": "/root/VAR/local_output/tb-VARd16__pn1_2_3_4_5_6_8_10_13_16__b96ep200adamlr0.0001wd0.05"
+}
+{'it': '13346/13346', 'ep': '1/200', 'lr': 1.9029852109246214e-05, 'wd': 0.05, 'grad_norm': 0.19156714379787446, 'L_mean': 8.039269471168518, 'L_tail': 8.013967045148213, 'acc_mean': 0.19965278799645603, 'acc_tail': 0.10538737299308802, 'vL_mean': None, 'vL_tail': None, 'vacc_mean': None, 'vacc_tail': None, 'remain_time': '49 days, 15:38:49', 'finish_time': '2025-05-13 09:13'}
