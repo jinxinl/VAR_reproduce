@@ -69,7 +69,7 @@ class VAR(nn.Module):
         # 3. absolute position embedding 位置嵌入
         pos_1LC = [] # 存储各分辨率尺度的位置编码
         for i, pn in enumerate(self.patch_nums):
-            pe = torch.empty(1, pn*pn, self.C) # 位置编码形状: (1,pn**2,C)，展平
+            pe = torch.empty(1, pn*pn, self.C) # 位置编码形状: (1,pn**2,C)
             nn.init.trunc_normal_(pe, mean=0, std=init_std) # 截断正态分布初始化权重
             pos_1LC.append(pe)
         pos_1LC = torch.cat(pos_1LC, dim=1) # concatenate on length, dim=1的总长为token总数，shape(1, L, C)
@@ -132,7 +132,7 @@ class VAR(nn.Module):
             h = resi + self.blocks[-1].drop_path(h) # 手动残差连接
         else:                               # fused_add_norm is not used
             h = h_or_h_and_residual # 直接使用已处理的特征
-        return self.head(self.head_nm(h.float(), cond_BD).float()).float()
+        return self.head(self.head_nm(h.float(), cond_BD).float()).float() # 使用条件向量动态调整归一化参数，再线性，从C投影到V投影
     
     @torch.no_grad()
     # inference
@@ -146,7 +146,7 @@ class VAR(nn.Module):
         :param B: batch size
         :param label_B: imagenet label; if None, randomly sampled
         :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
+        :param cfg: classifier-free guidance ratio 分类器自由引导
         :param top_k: top-k sampling
         :param top_p: top-p sampling
         :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
@@ -160,45 +160,55 @@ class VAR(nn.Module):
         elif isinstance(label_B, int):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
+        # Initialize
+        # sos: 双倍B，前B是有条件，后B是无条件
         sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
-        
+        # 三级编码叠加：类别嵌入+层级标识+位置编码
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         
-        for b in self.blocks: b.attn.kv_caching(True)
+        for b in self.blocks: b.attn.kv_caching(True) # 启用KV Cache
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
-            ratio = si / self.num_stages_minus_1
+            ratio = si / self.num_stages_minus_1 # 当前进度比例
             # last_L = cur_L
-            cur_L += pn*pn
+            cur_L += pn*pn # 累计已处理的token数，用于位置编码
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            x = next_token_map
-            AdaLNSelfAttn.forward
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD) # 生成AdaLN的参数
+            x = next_token_map # 基于前一尺度结果初始化当前尺度的输入token
+            AdaLNSelfAttn.forward # 显式调用forward
+            # 用所有Transformer块逐块提取x特征
             for b in self.blocks:
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD)
+            logits_BlV = self.get_logits(x, cond_BD) # 并行预测，一次性预测当前尺度所有位置的token概率分布
             
-            t = cfg * ratio
-            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
+            t = cfg * ratio # 条件控制线性渐进增强，
+            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:] # 双分支混合，前B有条件生成，后B无条件生成
             
+            # top_k/top_p采样
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth: # this is the default case
+                # 使用Codebook得到离散索引对应的连续特征
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
             else:   # not used when evaluating FID/IS/Precision/Recall
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
+            # shape: (B,L,C)->(B,C,H,W)
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+            # f_hat整合所有尺度的特征信息，next_token_map为跨尺度预测衔接
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
             if si != self.num_stages_minus_1:   # prepare for next stage
+                # change shape to (B,L,C)
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                # 层级标识+位置信息
                 next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
                 next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
         
         for b in self.blocks: b.attn.kv_caching(False)
+        # 返回对特征图解码重建的结果
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
@@ -210,31 +220,38 @@ class VAR(nn.Module):
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]
         with torch.cuda.amp.autocast(enabled=False):
+            # 条件丢弃
             label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
-            sos = cond_BD = self.class_emb(label_B)
+            sos = cond_BD = self.class_emb(label_B) # 类别嵌入
+            # 三级编码：类别嵌入+层级标识+位置编码
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
             
-            if self.prog_si == 0: x_BLC = sos
+            if self.prog_si == 0: x_BLC = sos # sos作为生成起点，仅使用起始token
+            # 拼接后续尺度的token
             else: x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+            # 加入层级标识和位置编码
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
         
-        attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+        attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed] # 生成下三角掩码，确保自回归性质
+        cond_BD_or_gss = self.shared_ada_lin(cond_BD) # 条件向量->自适应归一化参数
         
         # hack: get the dtype if mixed precision is used
         temp = x_BLC.new_ones(8, 8)
-        main_type = torch.matmul(temp, temp).dtype
+        main_type = torch.matmul(temp, temp).dtype # 获取系统混合精度下的主计算类型
         
-        x_BLC = x_BLC.to(dtype=main_type)
+        # 转化类型，确保所有张量使用相同的计算精度
+        x_BLC = x_BLC.to(dtype=main_type) 
         cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
         
-        AdaLNSelfAttn.forward
+        AdaLNSelfAttn.forward # 显式调用
+        # 使用所有Transformer块逐块提取特征
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD)
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD) # 并行化一次性得到输出的所有token的概率分布
         
         if self.prog_si == 0:
+            # 确保word_emb的参数也参与梯度计算
             if isinstance(self.word_embed, nn.Linear):
                 x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
             else:
@@ -246,46 +263,59 @@ class VAR(nn.Module):
         return x_BLC    # logits BLV, V is vocab_size
     
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
+        '''精细化权重初始化'''
+        '''
+        params: init_adaln 自适应层归一化的基础缩放因子
+                init_adaln_gamma 自适应层归一化中gamma参数的专用缩放因子
+                init_head 输出头的初始化缩放
+                init_std 基础初始化的标准差
+                conv_std_or_gain 卷积层的标准差/Xavier的增益系数
+        '''
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5     # init_std < 0: automated
         
+        # 分层初始化
         print(f'[init_weights] {type(self).__name__} with {init_std=:g}')
-        for m in self.modules():
-            with_weight = hasattr(m, 'weight') and m.weight is not None
-            with_bias = hasattr(m, 'bias') and m.bias is not None
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight.data, std=init_std)
-                if with_bias: m.bias.data.zero_()
-            elif isinstance(m, nn.Embedding):
+        for m in self.modules(): # 遍历所有子模块
+            with_weight = hasattr(m, 'weight') and m.weight is not None # 是否有weight属性
+            with_bias = hasattr(m, 'bias') and m.bias is not None # 是否有bias属性
+            if isinstance(m, nn.Linear): # Linear Layer
+                nn.init.trunc_normal_(m.weight.data, std=init_std) # 截断正态分布初始化weight
+                if with_bias: m.bias.data.zero_() # 0向量初始化bias
+            elif isinstance(m, nn.Embedding): # 嵌入层
                 nn.init.trunc_normal_(m.weight.data, std=init_std)
                 if m.padding_idx is not None: m.weight.data[m.padding_idx].zero_()
+            # 归一化层
             elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm, nn.GroupNorm, nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)):
-                if with_weight: m.weight.data.fill_(1.)
-                if with_bias: m.bias.data.zero_()
+                if with_weight: m.weight.data.fill_(1.) # 1向量初始化weight
+                if with_bias: m.bias.data.zero_() # 0向量初始化bias
             # conv: VAR has no conv, only VQVAE has conv
+            # 卷积层
             elif isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.ConvTranspose1d, nn.ConvTranspose2d, nn.ConvTranspose3d)):
                 if conv_std_or_gain > 0: nn.init.trunc_normal_(m.weight.data, std=conv_std_or_gain)
                 else: nn.init.xavier_normal_(m.weight.data, gain=-conv_std_or_gain)
                 if with_bias: m.bias.data.zero_()
         
+        # 输出头初始化
         if init_head >= 0:
-            if isinstance(self.head, nn.Linear):
+            if isinstance(self.head, nn.Linear): # 只有一层
                 self.head.weight.data.mul_(init_head)
                 self.head.bias.data.zero_()
-            elif isinstance(self.head, nn.Sequential):
+            elif isinstance(self.head, nn.Sequential): # 有许多层，最后一层缩小
                 self.head[-1].weight.data.mul_(init_head)
                 self.head[-1].bias.data.zero_()
-        
+        # AdaLN头
         if isinstance(self.head_nm, AdaLNBeforeHead):
             self.head_nm.ada_lin[-1].weight.data.mul_(init_adaln)
             if hasattr(self.head_nm.ada_lin[-1], 'bias') and self.head_nm.ada_lin[-1].bias is not None:
                 self.head_nm.ada_lin[-1].bias.data.zero_()
         
         depth = len(self.blocks)
+        # Transformer块初始化
         for block_idx, sab in enumerate(self.blocks):
             sab: AdaLNSelfAttn
-            sab.attn.proj.weight.data.div_(math.sqrt(2 * depth))
-            sab.ffn.fc2.weight.data.div_(math.sqrt(2 * depth))
-            if hasattr(sab.ffn, 'fcg') and sab.ffn.fcg is not None:
+            sab.attn.proj.weight.data.div_(math.sqrt(2 * depth)) # 注意力输出投影
+            sab.ffn.fc2.weight.data.div_(math.sqrt(2 * depth)) # FFN的第二层
+            if hasattr(sab.ffn, 'fcg') and sab.ffn.fcg is not None: # 门控线性单元
                 nn.init.ones_(sab.ffn.fcg.bias)
                 nn.init.trunc_normal_(sab.ffn.fcg.weight, std=1e-5)
             if hasattr(sab, 'ada_lin'):
