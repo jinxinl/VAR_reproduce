@@ -15,13 +15,13 @@ from .quant import VectorQuantizer2
 
 class VQVAE(nn.Module):
     def __init__(
-        self, vocab_size=4096, z_channels=32, ch=128, dropout=0.0,
-        beta=0.25,              # commitment loss weight
+        self, vocab_size=4096, z_channels=32, ch=128, dropout=0.0, # z_channels: 潜在空间的通道数 ch: 基础通道数，控制网络宽度
+        beta=0.25,              # commitment loss weight，平衡重构误差和码本学习
         using_znorm=False,      # whether to normalize when computing the nearest neighbors
         quant_conv_ks=3,        # quant conv kernel size
-        quant_resi=0.5,         # 0.5 means \phi(x) = 0.5conv(x) + (1-0.5)x
-        share_quant_resi=4,     # use 4 \phi layers for K scales: partially-shared \phi
-        default_qresi_counts=0, # if is 0: automatically set to len(v_patch_nums)
+        quant_resi=0.5,         # 0.5 means \phi(x) = 0.5conv(x) + (1-0.5)x，残差量化的比例
+        share_quant_resi=4,     # use 4 \phi layers for K scales: partially-shared \phi，多尺度量化时共享的\phi层数量
+        default_qresi_counts=0, # if is 0: automatically set to len(v_patch_nums) 默认量化残差层数
         v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16), # number of patches for each scale, h_{1 to K} = w_{1 to K} = v_patch_nums[k]
         test_mode=True,
     ):
@@ -29,8 +29,9 @@ class VQVAE(nn.Module):
         self.test_mode = test_mode
         self.V, self.Cvae = vocab_size, z_channels
         # ddconfig is copied from https://github.com/CompVis/latent-diffusion/blob/e66308c7f2e64cb581c6d27ab6fbeb846828253b/models/first_stage_models/vq-f16/config.yaml
-        ddconfig = dict(
+        ddconfig = dict( # 创建Encoder Decoder的配置字典，参考了CompVis的VQ-f16配置
             dropout=dropout, ch=ch, z_channels=z_channels,
+            # ch_mult: 不同分辨率下通道数的倍增系数
             in_channels=3, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,   # from vq-f16/config.yaml above
             using_sa=True, using_mid_sa=True,                           # from vq-f16/config.yaml above
             # resamp_with_conv=True,   # always True, removed.
@@ -40,11 +41,13 @@ class VQVAE(nn.Module):
         self.decoder = Decoder(**ddconfig)
         
         self.vocab_size = vocab_size
-        self.downsample = 2 ** (len(ddconfig['ch_mult'])-1)
-        self.quantize: VectorQuantizer2 = VectorQuantizer2(
+        # 量化相关组件
+        self.downsample = 2 ** (len(ddconfig['ch_mult'])-1) # 下采样率 
+        self.quantize: VectorQuantizer2 = VectorQuantizer2( # VQ2负责潜在变量离散化
             vocab_size=vocab_size, Cvae=self.Cvae, using_znorm=using_znorm, beta=beta,
             default_qresi_counts=default_qresi_counts, v_patch_nums=v_patch_nums, quant_resi=quant_resi, share_quant_resi=share_quant_resi,
         )
+        # 初始化量化前后卷积层
         self.quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks//2)
         self.post_quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks//2)
         
@@ -60,9 +63,14 @@ class VQVAE(nn.Module):
     # ===================== `forward` is only used in VAE training =====================
     
     def fhat_to_img(self, f_hat: torch.Tensor):
+        # fhat是经过量化的潜在变量
+        # post_quant_conv对量化后的特征做卷积处理
+        # 对卷积结果进行解码
+        # 最后进行数值裁剪，归一化返回的图像，元素范围是[-1,1]
         return self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1)
     
     def img_to_idxBl(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:    # return List[Bl]
+        # input -> codebook index
         f = self.quant_conv(self.encoder(inp_img_no_grad))
         return self.quantize.f_to_idxBl_or_fhat(f, to_fhat=False, v_patch_nums=v_patch_nums)
     
