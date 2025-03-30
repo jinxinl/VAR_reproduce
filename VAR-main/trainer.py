@@ -126,7 +126,7 @@ class VARTrainer(object):
         
         # img-token sequence
         gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW) # shape (B,L,V)
-        gt_BL = torch.cat(gt_idx_Bl, dim=1) # concatenate on dimension Channel
+        gt_BL = torch.cat(gt_idx_Bl, dim=1) # 拼接多尺度序列
         # token -> quantization feature
         x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl) 
         

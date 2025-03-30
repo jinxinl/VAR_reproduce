@@ -169,18 +169,21 @@ class VectorQuantizer2(nn.Module):
     def idxBl_to_var_input(self, gt_ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
         next_scales = []
         B = gt_ms_idx_Bl[0].shape[0]
-        C = self.Cvae
+        C = self.Cvae # 隐变量维度
         H = W = self.v_patch_nums[-1]
-        SN = len(self.v_patch_nums)
+        SN = len(self.v_patch_nums) # 尺度数量
         
-        f_hat = gt_ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32)
-        pn_next: int = self.v_patch_nums[0]
+        f_hat = gt_ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32) # 全零张量，为了累计多尺度特征
+        pn_next: int = self.v_patch_nums[0] # 记录当前处理的尺度
         for si in range(SN-1):
             if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break   # progressive training: not supported yet, prog_si always -1
+            # embedding层用于将token索引转为对应嵌入向量
+            # interplote，使用双三次插值将所有尺度的特征统一到最大分辨率
             h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn_next, pn_next), size=(H, W), mode='bicubic')
-            f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
+            f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw)) # 残差量化，调整量化后的特征
             pn_next = self.v_patch_nums[si+1]
             next_scales.append(F.interpolate(f_hat, size=(pn_next, pn_next), mode='area').view(B, C, -1).transpose(1, 2))
+        # 所有尺度的特征序列沿序列维度拼接
         return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
     
     # ===================== get_next_autoregressive_input: only used in VAR inference, for getting next step's input =====================

@@ -42,35 +42,39 @@ class AmpOptimizer:
         # backward
         loss = loss.mul(self.r_accu)   # r_accu == 1.0 / n_gradient_accumulation
         orig_norm = scaler_sc = None
-        if self.scaler is not None:
+        if self.scaler is not None: # 启用了GradScaler，用缩放后的损失进行反向传播
             self.scaler.scale(loss).backward(retain_graph=False, create_graph=False)
         else:
             loss.backward(retain_graph=False, create_graph=False)
         
-        if stepping:
-            if self.scaler is not None: self.scaler.unscale_(self.optimizer)
-            if self.early_clipping:
+        if stepping: # 进行梯度更新
+            if self.scaler is not None: self.scaler.unscale_(self.optimizer) # 取消梯度缩放
+            if self.early_clipping: # 早期梯度裁剪
+                # 优化器执行前进行梯度裁剪，clip_grad_norm_是裁剪梯度范数
                 orig_norm = torch.nn.utils.clip_grad_norm_(self.paras, self.grad_clip)
             
             if self.scaler is not None:
-                self.scaler.step(self.optimizer)
-                scaler_sc: float = self.scaler.get_scale()
+                # 混合精度训练的关键步骤
+                self.scaler.step(self.optimizer) # 梯度更新，首先会反向缩放梯度，再调用optimizer.step
+                scaler_sc: float = self.scaler.get_scale() # 当前缩放器尺度
+                # 上溢
                 if scaler_sc > 32768.: # fp16 will overflow when >65536, so multiply 32768 could be dangerous
                     self.scaler.update(new_scale=32768.)
                 else:
                     self.scaler.update()
                 try:
+                    # 转化为对数尺度
                     scaler_sc = float(math.log2(scaler_sc))
                 except Exception as e:
                     print(f'[scaler_sc = {scaler_sc}]\n' * 15, flush=True)
                     raise e
             else:
-                self.optimizer.step()
+                self.optimizer.step() # 优化器进行梯度更新
             
-            if self.late_clipping:
+            if self.late_clipping: # 后期梯度裁剪
                 orig_norm = self.optimizer.global_grad_norm
             
-            self.optimizer.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad(set_to_none=True) # 清空梯度
         
         return orig_norm, scaler_sc
     

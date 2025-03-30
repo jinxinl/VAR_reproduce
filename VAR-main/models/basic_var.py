@@ -167,8 +167,9 @@ class AdaLNBeforeHead(nn.Module):
         super().__init__()
         self.C, self.D = C, D
         self.ln_wo_grad = norm_layer(C, elementwise_affine=False)
-        self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), nn.Linear(D, 2*C))
+        self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), nn.Linear(D, 2*C)) # SiLu+Linear layer
     
     def forward(self, x_BLC: torch.Tensor, cond_BD: torch.Tensor):
-        scale, shift = self.ada_lin(cond_BD).view(-1, 1, 2, self.C).unbind(2)
+        # gamma: scale; beta: shift
+        scale, shift = self.ada_lin(cond_BD).view(-1, 1, 2, self.C).unbind(2) # 拆分
         return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
