@@ -201,7 +201,7 @@ graph TD
     - 层级标识：为了区分不同分辨率的离散token
     - 位置编码：Transformer计算时缺少位置信息，需要输入中自带位置编码
 
-    上面的嵌入都是通过 `nn.Embedding` 实现的，类别嵌入是对标签计算，位置嵌入是可学习的参数，使用截断正态分布初始化，形状是 $(1,L,C)$ ，层级标识是用尺度作为输入，也是可学习的参数，形状是 $(patch_nums,C)$ 
+    上面的嵌入都是通过 `nn.Embedding` 实现的，类别嵌入是对标签计算，位置嵌入是可学习的参数，使用截断正态分布初始化，形状是 $(1,L,C)$ ，层级标识是用尺度作为输入，也是可学习的参数，形状是 $(patch\_nums,C)$ 
 
   - 位置编码如何计算
 
@@ -295,24 +295,65 @@ graph TD
 
 - 分类器自由引导 `Classifier-Free Guidance` 
 
+  - 生成扩散模型中常用方法：一种用于条件扩散模型的生成控制技术，通过隐式混合条件和无条件预测 *增强* 生成结果对输入条件的遵循程度，且无需依赖预训练的分类器
+
+  - 原理：
+
+    - 有条件生成
+      $$
+      \epsilon_{\theta}=(x_t,t,y)
+      $$
+      其中， $x_t$ 是第 $t$ 个时间步的噪声图像，$y$ 是条件
+
+    - 无条件生成
+      $$
+      \epsilon_{\theta}=(x_t,t)
+      $$
+
+    - 引导生成时的插值
+
+      在推理时，通过线性组合与无条件预测，增强条件控制
+      $$
+      \hat{\epsilon_{\theta}}=\epsilon_{\theta}(x_t,t)+w\cdot(\epsilon_{\theta}(x_t,t,y)-\epsilon_{\theta}(x_t,t))
+      $$
+      $w$ 是条件控制强度，一般有 $w\ge 1$ ，并且
+
+      - 当 $w=1$ 时，只有条件控制，纯条件生成
+      - 当 $w>1$ 时，增强条件生成，放大条件影响（更严格地遵循提示）
+
+      【$w$ 过低，即 $w≈1$ 时，生成结果可能忽略条件，$w$ 过大，即 $w\ge 10$ 时，可能过拟合条件，导致图像失真】
+
+    - 为什么有效：
+
+      - $\epsilon_{\theta}(x_t,t,y)-\epsilon_{\theta}(x_t,t)$ 隐含了条件 $y$ 对生成的梯度的指导方向（生成方向的指导作用），相当于 `Classifier Guidance` 中分类器梯度的角色
+      - 稳定，无需分类器，避免了分类器与生成模型目标不一致的问题（Discrimitive v.s. Generative） 
+      - 不受分类器性能上限的制约
+
   - 使用条件控制+双倍通道实现 `CFG` 
+
+  - 训练阶段使用条件随机丢弃，为实现推理阶段的 `CFG` 奠定基础，强制模型必须同时学习有条件生成和无条件生成，并且在 `get_logits` 中使用条件向量 `cond_B` 动态调整归一化层参数，实现条件控制
+
+    【条件随即丢弃率一般选择 $0.1\sim 0.2$ ，平衡有条件和无条件生成的能力】
 
   - 条件向量 $cond\_B$ 的计算如下：
 
     ```python
-    t = cfg * ratio # 条件控制线性渐进增强，
-    logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:] # 双分支混合，前B有条件生成，后B无条件生成
+    # 双分支输入：前B个样本为条件生成，后B个为无条件生成，值为num_classes
+    sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+    # 通过Transformer计算logits
+    logits_BlV = self.get_logits(x, cond_BD)
+    # CFG混合：加权插值条件与无条件预测
+    t = cfg * ratio  # 渐进增强系数（ratio为当前生成阶段进度）
+    logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]  # 前B为条件，后B为无条件
     ```
 
     最终使用 `logits_Blv` 进行采样，平衡准确性与多样性。
 
-    - $t=0$ ：虽然是条件路径，但是实际上是无条件【为什么？】
-    - $t=1$ 
-    - $t>1$
+    
 
-  - 
-
-  - 
+    - $t=0$ ：纯条件生成，高保真但低多样性
+    - $t=1$ ：标准 `CFG` 配置，平衡条件与多样性
+    - $t>1$ ：强条件生成，可能过拟合，导致图像失真
 
 - `top_k` 采样与 `top_p` 采样
 
@@ -354,7 +395,7 @@ graph TD
 
   - 公式
     $$
-    FID=\|\mu_r-\mu_g\|^2+Tr(\Sigma_r+\Sigma_g-2\sqrt\Sigma_r\Sigma_g)
+    FID=\|\mu_r-\mu_g\|^2+Tr(\Sigma_r+\Sigma_g-2\sqrt{\Sigma_r\Sigma_g})
     $$
     其中，$\mu_r$ 和 $\mu_g$ 分别是生成图像和真实图像特征的均值向量，$\Sigma_r$ 和 $\Sigma_g$ 分别是生成图像和真实图像特征的协方差矩阵，$Tr(x)$ 是指 $x$ 矩阵的对角线之和，即 *矩阵的迹* 
 
