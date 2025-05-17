@@ -97,6 +97,10 @@
   - 构建数据集，按照README中指定形式，使用ImageNet-1K（2012）
     
     > 参考：[linux下载/解压ImageNet-1k数据集_imagenet1k下载-CSDN博客](https://blog.csdn.net/qq_45588019/article/details/125642466)
+    >
+    > [ImageNet数据集简介与下载详细步骤-CSDN博客](https://blog.csdn.net/qq_36665989/article/details/119947229)
+    >
+    > [下载、处理、加载ImageNet数据集（全网最详细）_imagenet数据集下载-CSDN博客](https://blog.csdn.net/weixin_47160526/article/details/132037269)
     
     - 问题：
     
